@@ -10,43 +10,43 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/webview/webview_go"
 )
 
 const API_PORT = "9843"
-const SERVE_PORT = "9844"
+const FILE_SERVER_PORT = "9844"
+const LIVE_SERVER_PORT = "9845"
 
-var (
-	mu            sync.Mutex
-	appTempDir    string
-	serverTempDir string
-	currentWin    webview.WebView
-	fileServer    *http.Server
-	liveServer    *http.Server
-)
+var mu sync.Mutex
+var appTempDir string
+var serveTempDir string
+var liveServeTempDir string
+var currentWin webview.WebView
+var fileServeMux *http.ServeMux
+var fileServer *http.Server
+var liveServer *http.Server
+var winClosed = make(chan bool, 1)
 
-type LaunchPayload struct {
-	HTML     string `json:"html"`
-	Filename string `json:"filename"`
-	Mode     string `json:"mode"` // "overlay", "window", "fullscreen", "float"
-}
-
-type ZipPayload struct {
-	Data     string `json:"data"` // base64 encoded zip
-	Filename string `json:"filename"`
-	Mode     string `json:"mode"`
-}
-
-type ServePayload struct {
-	Files map[string]string `json:"files"` // filename -> base64 content
-	Entry string            `json:"entry"` // entry file e.g. "index.html"
-}
-
-func corsHeaders(w http.ResponseWriter) {
+func cors(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Content-Type", "application/json")
+}
+
+func main() {
+	var err error
+	appTempDir, err = os.MkdirTemp("", "appdeploy-app-*")
+	if err != nil {
+		fmt.Println("Failed to create temp dir")
+		return
+	}
+	defer os.RemoveAll(appTempDir)
+
+	startFileServer()
+	startAPIServer()
 }
 
 func startAPIServer() {
@@ -54,42 +54,22 @@ func startAPIServer() {
 
 	// Ping
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		corsHeaders(w)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "2.0.0", "app": "AppDeploy"})
+		cors(w)
+		if r.Method == "OPTIONS" { w.WriteHeader(200); return }
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.0.0"})
 	})
 
-	// Launch single HTML file as app
+	// Launch - handles both HTML and ZIP
 	mux.HandleFunc("/launch", func(w http.ResponseWriter, r *http.Request) {
-		corsHeaders(w)
-		w.Header().Set("Content-Type", "application/json")
+		cors(w)
 		if r.Method == "OPTIONS" { w.WriteHeader(200); return }
 		if r.Method != "POST" { w.WriteHeader(405); return }
 
-		var payload LaunchPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "invalid json"})
-			return
-		}
-
-		go launchApp(payload.HTML, payload.Filename, payload.Mode)
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
-	// Launch a full zip as app (multi-file)
-	mux.HandleFunc("/launch-zip", func(w http.ResponseWriter, r *http.Request) {
-		corsHeaders(w)
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method == "OPTIONS" { w.WriteHeader(200); return }
-		if r.Method != "POST" { w.WriteHeader(405); return }
-
-		// Parse multipart form - zip uploaded as binary
-		r.ParseMultipartForm(512 << 20) // 512mb max
-		file, header, err := r.FormFile("zip")
+		r.ParseMultipartForm(512 << 20)
+		file, header, err := r.FormFile("file")
 		if err != nil {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "no zip file"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "no file"})
 			return
 		}
 		defer file.Close()
@@ -97,145 +77,182 @@ func startAPIServer() {
 		mode := r.FormValue("mode")
 		if mode == "" { mode = "window" }
 
-		// Save zip to temp
-		tmpZip, _ := os.CreateTemp("", "appdeploy-*.zip")
-		io.Copy(tmpZip, file)
-		tmpZip.Close()
+		// Kill existing window cleanly
+		closeCurrentWindow()
 
-		// Extract zip
+		// Fresh temp dir
 		mu.Lock()
-		if appTempDir != "" { os.RemoveAll(appTempDir) }
+		os.RemoveAll(appTempDir)
 		appTempDir, _ = os.MkdirTemp("", "appdeploy-app-*")
-		extractDir := appTempDir
+		dir := appTempDir
 		mu.Unlock()
 
-		if err := unzip(tmpZip.Name(), extractDir); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": "failed to extract zip"})
-			return
-		}
-		os.Remove(tmpZip.Name())
+		isZip := strings.HasSuffix(strings.ToLower(header.Filename), ".zip")
 
-		// Find entry point - look for index.html, unwrap single nested folder
-		entryDir := findEntryDir(extractDir)
-		entryFile := filepath.Join(entryDir, "index.html")
+		if isZip {
+			// Save zip
+			tmpZip := filepath.Join(dir, "upload.zip")
+			f, _ := os.Create(tmpZip)
+			io.Copy(f, file)
+			f.Close()
 
-		// Check meta tag for mode override
-		if htmlBytes, err := os.ReadFile(entryFile); err == nil {
-			if m := extractMetaMode(string(htmlBytes)); m != "" {
-				mode = m
+			// Extract
+			extractDir := filepath.Join(dir, "app")
+			os.MkdirAll(extractDir, 0755)
+			if err := unzip(tmpZip, extractDir); err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(map[string]string{"error": "unzip failed"})
+				return
 			}
+			os.Remove(tmpZip)
+
+			// Find index.html
+			entryDir := findEntryDir(extractDir)
+
+			// Check mode override in meta tag
+			idxFile := filepath.Join(entryDir, "index.html")
+			if b, err := os.ReadFile(idxFile); err == nil {
+				if m := extractMode(string(b)); m != "" { mode = m }
+			}
+
+			// Update file server root
+			updateFileServer(entryDir)
+
+			go launchWindow("http://localhost:"+FILE_SERVER_PORT+"/", header.Filename, mode)
+		} else {
+			// Single HTML file
+			htmlBytes, _ := io.ReadAll(file)
+			html := string(htmlBytes)
+
+			// Check mode override
+			if m := extractMode(html); m != "" { mode = m }
+
+			// Write to temp
+			htmlPath := filepath.Join(dir, "index.html")
+			os.WriteFile(htmlPath, htmlBytes, 0644)
+
+			// Serve via file server so relative paths work
+			updateFileServer(dir)
+
+			go launchWindow("http://localhost:"+FILE_SERVER_PORT+"/index.html", header.Filename, mode)
 		}
 
-		// Start file server for this app
-		stopFileServer()
-		startFileServer(entryDir)
-
-		go openWindow("http://localhost:"+SERVE_PORT+"/", header.Filename, mode)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	// Serve a folder as live server
+	// Close window
+	mux.HandleFunc("/close", func(w http.ResponseWriter, r *http.Request) {
+		cors(w)
+		if r.Method == "OPTIONS" { w.WriteHeader(200); return }
+		closeCurrentWindow()
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// Live server - serve a zip as a local website
 	mux.HandleFunc("/serve", func(w http.ResponseWriter, r *http.Request) {
-		corsHeaders(w)
-		w.Header().Set("Content-Type", "application/json")
+		cors(w)
 		if r.Method == "OPTIONS" { w.WriteHeader(200); return }
 		if r.Method != "POST" { w.WriteHeader(405); return }
 
-		// Accept zip of files to serve
 		r.ParseMultipartForm(512 << 20)
-		file, _, err := r.FormFile("zip")
+		file, _, err := r.FormFile("file")
 		if err != nil {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "no zip"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "no file"})
 			return
 		}
 		defer file.Close()
 
-		// Save and extract to serve dir
-		tmpZip, _ := os.CreateTemp("", "appdeploy-serve-*.zip")
-		io.Copy(tmpZip, file)
-		tmpZip.Close()
+		// Stop existing live server
+		if liveServer != nil {
+			liveServer.Close()
+			liveServer = nil
+		}
+		if liveServeTempDir != "" {
+			os.RemoveAll(liveServeTempDir)
+		}
+		liveServeTempDir, _ = os.MkdirTemp("", "appdeploy-live-*")
 
-		mu.Lock()
-		if serverTempDir != "" { os.RemoveAll(serverTempDir) }
-		serverTempDir, _ = os.MkdirTemp("", "appdeploy-serve-*")
-		serveDir := serverTempDir
-		mu.Unlock()
+		tmpZip := filepath.Join(liveServeTempDir, "upload.zip")
+		f, _ := os.Create(tmpZip)
+		io.Copy(f, file)
+		f.Close()
 
-		unzip(tmpZip.Name(), serveDir)
-		os.Remove(tmpZip.Name())
+		extractDir := filepath.Join(liveServeTempDir, "site")
+		os.MkdirAll(extractDir, 0755)
+		unzip(tmpZip, extractDir)
+		os.Remove(tmpZip)
 
-		entryDir := findEntryDir(serveDir)
-		stopLiveServer()
-		startLiveServer(entryDir)
+		entryDir := findEntryDir(extractDir)
+
+		// Start live server
+		lsMux := http.NewServeMux()
+		lsMux.Handle("/", http.FileServer(http.Dir(entryDir)))
+		liveServer = &http.Server{Addr: "127.0.0.1:" + LIVE_SERVER_PORT, Handler: lsMux}
+		go liveServer.ListenAndServe()
 
 		json.NewEncoder(w).Encode(map[string]string{
 			"status": "ok",
-			"url":    "http://localhost:9845/",
+			"url":    "http://localhost:" + LIVE_SERVER_PORT + "/",
 		})
 	})
 
 	// Stop live server
 	mux.HandleFunc("/serve/stop", func(w http.ResponseWriter, r *http.Request) {
-		corsHeaders(w)
-		w.Header().Set("Content-Type", "application/json")
-		stopLiveServer()
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
-	// Close current app window
-	mux.HandleFunc("/close", func(w http.ResponseWriter, r *http.Request) {
-		corsHeaders(w)
-		w.Header().Set("Content-Type", "application/json")
-		mu.Lock()
-		if currentWin != nil {
-			currentWin.Destroy()
-			currentWin = nil
+		cors(w)
+		if r.Method == "OPTIONS" { w.WriteHeader(200); return }
+		if liveServer != nil {
+			liveServer.Close()
+			liveServer = nil
 		}
-		mu.Unlock()
-		stopFileServer()
+		if liveServeTempDir != "" {
+			os.RemoveAll(liveServeTempDir)
+			liveServeTempDir = ""
+		}
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	fmt.Println("AppDeploy API running on http://localhost:" + API_PORT)
+	fmt.Println("AppDeploy running on http://localhost:" + API_PORT)
 	http.ListenAndServe("127.0.0.1:"+API_PORT, mux)
 }
 
-func launchApp(html, filename, mode string) {
-	mu.Lock()
-	if currentWin != nil {
-		currentWin.Destroy()
-		currentWin = nil
-	}
-	if appTempDir != "" {
-		os.RemoveAll(appTempDir)
-	}
-	appTempDir, _ = os.MkdirTemp("", "appdeploy-app-*")
-	dir := appTempDir
-	mu.Unlock()
-
-	// Check meta tag for mode
-	if m := extractMetaMode(html); m != "" {
-		mode = m
-	}
-
-	tmpFile := filepath.Join(dir, "app.html")
-	os.WriteFile(tmpFile, []byte(html), 0644)
-
-	openWindow("file:///"+filepath.ToSlash(tmpFile), filename, mode)
-
-	mu.Lock()
-	currentWin = nil
-	os.RemoveAll(dir)
-	appTempDir, _ = os.MkdirTemp("", "appdeploy-app-*")
-	mu.Unlock()
+func startFileServer() {
+	fileServeMux = http.NewServeMux()
+	fileServeMux.Handle("/", http.FileServer(http.Dir(appTempDir)))
+	fileServer = &http.Server{Addr: "127.0.0.1:" + FILE_SERVER_PORT, Handler: fileServeMux}
+	go fileServer.ListenAndServe()
 }
 
-func openWindow(url, title, mode string) {
-	debug := false
-	w := webview.New(debug)
-	defer w.Destroy()
+func updateFileServer(dir string) {
+	// Restart file server pointing at new dir
+	if fileServer != nil {
+		fileServer.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+	newMux := http.NewServeMux()
+	newMux.Handle("/", http.FileServer(http.Dir(dir)))
+	fileServer = &http.Server{Addr: "127.0.0.1:" + FILE_SERVER_PORT, Handler: newMux}
+	go fileServer.ListenAndServe()
+	time.Sleep(150 * time.Millisecond)
+}
+
+func closeCurrentWindow() {
+	mu.Lock()
+	w := currentWin
+	currentWin = nil
+	mu.Unlock()
+
+	if w != nil {
+		w.Dispatch(func() {
+			w.Terminate()
+		})
+		// Give it time to close
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func launchWindow(url, title, mode string) {
+	w := webview.New(false)
 
 	mu.Lock()
 	currentWin = w
@@ -246,8 +263,10 @@ func openWindow(url, title, mode string) {
 	switch mode {
 	case "fullscreen":
 		w.SetSize(1920, 1080, webview.HintFixed)
-	case "overlay", "float":
+	case "overlay":
 		w.SetSize(1920, 1080, webview.HintFixed)
+	case "float":
+		w.SetSize(480, 320, webview.HintNone)
 	case "small":
 		w.SetSize(400, 300, webview.HintNone)
 	default:
@@ -256,38 +275,13 @@ func openWindow(url, title, mode string) {
 
 	w.Navigate(url)
 	w.Run()
-}
+	w.Destroy()
 
-func startFileServer(dir string) {
-	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.Dir(dir)))
-	fileServer = &http.Server{Addr: "127.0.0.1:" + SERVE_PORT, Handler: mux}
-	go fileServer.ListenAndServe()
-}
-
-func stopFileServer() {
-	if fileServer != nil {
-		fileServer.Close()
-		fileServer = nil
+	mu.Lock()
+	if currentWin == w {
+		currentWin = nil
 	}
-}
-
-func startLiveServer(dir string) {
-	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.Dir(dir)))
-	liveServer = &http.Server{Addr: "127.0.0.1:9845", Handler: mux}
-	go liveServer.ListenAndServe()
-}
-
-func stopLiveServer() {
-	if liveServer != nil {
-		liveServer.Close()
-		liveServer = nil
-	}
-	if serverTempDir != "" {
-		os.RemoveAll(serverTempDir)
-		serverTempDir = ""
-	}
+	mu.Unlock()
 }
 
 func unzip(src, dest string) error {
@@ -296,7 +290,7 @@ func unzip(src, dest string) error {
 	defer r.Close()
 
 	for _, f := range r.File {
-		fpath := filepath.Join(dest, f.Name)
+		fpath := filepath.Join(dest, filepath.FromSlash(f.Name))
 		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
 			continue
 		}
@@ -305,23 +299,21 @@ func unzip(src, dest string) error {
 			continue
 		}
 		os.MkdirAll(filepath.Dir(fpath), os.ModePerm)
-		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		out, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
 		if err != nil { continue }
 		rc, err := f.Open()
-		if err != nil { outFile.Close(); continue }
-		io.Copy(outFile, rc)
-		outFile.Close()
+		if err != nil { out.Close(); continue }
+		io.Copy(out, rc)
+		out.Close()
 		rc.Close()
 	}
 	return nil
 }
 
 func findEntryDir(dir string) string {
-	// If index.html exists at root, use root
 	if _, err := os.Stat(filepath.Join(dir, "index.html")); err == nil {
 		return dir
 	}
-	// Otherwise look one level deep for a folder with index.html
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
 		if e.IsDir() {
@@ -334,12 +326,11 @@ func findEntryDir(dir string) string {
 	return dir
 }
 
-func extractMetaMode(html string) string {
+func extractMode(html string) string {
 	lower := strings.ToLower(html)
 	idx := strings.Index(lower, `name="appdeploy"`)
 	if idx == -1 { return "" }
-	// Find content attribute nearby
-	chunk := lower[idx : min(idx+200, len(lower))]
+	chunk := lower[idx:min(idx+200, len(lower))]
 	ci := strings.Index(chunk, `content="`)
 	if ci == -1 { return "" }
 	rest := chunk[ci+9:]
@@ -351,11 +342,4 @@ func extractMetaMode(html string) string {
 func min(a, b int) int {
 	if a < b { return a }
 	return b
-}
-
-func main() {
-	appTempDir, _ = os.MkdirTemp("", "appdeploy-app-*")
-	defer os.RemoveAll(appTempDir)
-
-	startAPIServer()
 }
