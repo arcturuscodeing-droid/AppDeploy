@@ -25,8 +25,7 @@ jobs:
           cd AppDeploy/AppDeploy/launcher
           go mod init appdeploy
           go get github.com/webview/webview_go
-          copy ..\..\..\main.go .
-          go build -ldflags="-H windowsgui -s -w" -o ..\..\..\AppDeploy-Launcher.exe .
+          go build -ldflags="-H windowsgui -s -w" -o ../../../AppDeploy-Launcher.exe .
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -36,7 +35,6 @@ jobs:
           body: |
             ## AppDeploy Launcher v2
             Download AppDeploy-Launcher.exe and run it once, never touch it again.
-            Supports single HTML files, ZIP apps, overlay mode, and live server.
           files: AppDeploy-Launcher.exe
           make_latest: true
         env:
